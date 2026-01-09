@@ -27,8 +27,8 @@ ZK Brain gives you:
 ### Quick Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/toolkit.git
-cd toolkit/zk-brain
+git clone https://github.com/davidiscarvalho/claude_code_toolkit.git
+cd skills/zk-brain
 ./install.sh
 ```
 
