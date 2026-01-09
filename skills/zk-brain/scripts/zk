@@ -1,7 +1,7 @@
 #!/bin/bash
 # zk - Zettelkasten Brain CLI for Claude Code
 # Token-efficient personal knowledge base using SQLite
-# Version: 1.1.0
+# Version: 1.2.0
 
 set -e
 
@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS notes (
     content TEXT NOT NULL,
     tags TEXT DEFAULT '',
     project TEXT DEFAULT NULL,
+    related_ids TEXT DEFAULT '',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     archived_at DATETIME DEFAULT NULL
@@ -118,6 +119,22 @@ ensure_db() {
     fi
 }
 
+# Upgrade database schema (for v1.1.0 -> v1.2.0)
+upgrade_db() {
+    ensure_db
+    # Check if related_ids column exists
+    local has_column
+    has_column=$(sqlite3 "$DB_FILE" "PRAGMA table_info(notes);" | grep -c "related_ids" || true)
+
+    if [ "$has_column" -eq 0 ]; then
+        echo "Upgrading database schema to v1.2.0..."
+        sqlite3 "$DB_FILE" "ALTER TABLE notes ADD COLUMN related_ids TEXT DEFAULT '';"
+        echo "✓ Database upgraded successfully"
+    else
+        echo "Database is already at v1.2.0 or later"
+    fi
+}
+
 # Get current project from git or directory name
 get_current_project() {
     local proj
@@ -125,10 +142,60 @@ get_current_project() {
     echo "$proj"
 }
 
+# Add related ID (maintains uniqueness, no duplicates)
+add_related_id() {
+    local note_id="$1"
+    local related_id="$2"
+
+    # Get current related_ids
+    local current
+    current=$(sqlite3 "$DB_FILE" "SELECT related_ids FROM notes WHERE id = $note_id;")
+
+    # Check if already present
+    if echo ",$current," | grep -q ",$related_id,"; then
+        return 0  # Already linked
+    fi
+
+    # Add the new ID
+    if [ -n "$current" ]; then
+        current="$current,$related_id"
+    else
+        current="$related_id"
+    fi
+
+    sqlite3 "$DB_FILE" "UPDATE notes SET related_ids = '$current' WHERE id = $note_id;"
+}
+
+# Remove related ID
+remove_related_id() {
+    local note_id="$1"
+    local related_id="$2"
+
+    local current
+    current=$(sqlite3 "$DB_FILE" "SELECT related_ids FROM notes WHERE id = $note_id;")
+
+    # Remove the ID using sed
+    local updated
+    updated=$(echo "$current" | sed "s/^$related_id,//; s/,$related_id,/,/g; s/,$related_id$//; s/^$related_id$//")
+
+    sqlite3 "$DB_FILE" "UPDATE notes SET related_ids = '$updated' WHERE id = $note_id;"
+}
+
+# Get related notes as array
+get_related_ids() {
+    local note_id="$1"
+    local related_ids
+    related_ids=$(sqlite3 "$DB_FILE" "SELECT related_ids FROM notes WHERE id = $note_id;")
+
+    if [ -n "$related_ids" ]; then
+        echo "$related_ids"
+    fi
+}
+
 # Usage/help
 usage() {
     cat <<'EOF'
-zk - Zettelkasten Brain CLI (v1.1.0)
+zk - Zettelkasten Brain CLI (v1.2.0)
 
 SEARCH (cheap - returns IDs + titles only, ~50 tokens):
   zk search "query"              Search all active notes
@@ -137,7 +204,7 @@ SEARCH (cheap - returns IDs + titles only, ~50 tokens):
   zk search -t TAG "query"       Filter by tag
 
 RETRIEVE (fetch full content when needed):
-  zk get ID                      Get full note by ID
+  zk get ID                      Get full note by ID (shows related notes)
   zk get ID ID2 ...              Get multiple notes
 
 ADD/UPDATE:
@@ -146,6 +213,12 @@ ADD/UPDATE:
   zk update ID "new content"                Update note content
   zk update ID -t "new,tags"                Update tags
   zk update ID -T "new title"               Update title
+
+LINK NOTES (knowledge graphs):
+  zk link ID1 ID2                Link two notes (bidirectional)
+  zk unlink ID1 ID2              Remove link between notes
+  zk related ID                  List related notes (minimal)
+  zk related ID --full           Get full content of all related notes
 
 LIST (minimal output):
   zk list                        List all active notes (id, title, project)
@@ -168,6 +241,7 @@ BULK OPERATIONS:
 
 MAINTENANCE:
   zk init                        Initialize/reset database
+  zk upgrade                     Upgrade database schema (v1.1.0 -> v1.2.0)
   zk vacuum                      Optimize database
   zk backup [FILE]               Backup database
 
@@ -176,6 +250,8 @@ Examples:
   zk add "Clerk redirect fix" "auth,clerk,bug" "After user creation, use..."
   zk add -p . "API rate limits" "api,limits" "Current limits: 100/min"
   zk get 42
+  zk link 42 43                  # Link decision to implementation
+  zk related 42                  # Show all notes related to #42
   zk list -p myproject
 EOF
 }
@@ -281,8 +357,28 @@ SELECT '---', id, title, tags, COALESCE(project, 'global'),
        CASE WHEN archived_at IS NOT NULL THEN 'ARCHIVED' ELSE 'active' END
 FROM notes WHERE id = $id;
 SELECT content FROM notes WHERE id = $id;
-SELECT '---';
 SQL
+
+        # Show related notes if any
+        local related_ids
+        related_ids=$(get_related_ids "$id")
+
+        if [ -n "$related_ids" ]; then
+            echo "---"
+            echo -e "${CYAN}Related notes:${RESET}"
+
+            # Convert comma-separated IDs to array and fetch titles
+            IFS=',' read -ra IDS <<< "$related_ids"
+            for rid in "${IDS[@]}"; do
+                if note_exists "$rid"; then
+                    local related_info
+                    related_info=$(sqlite3 -separator '|' "$DB_FILE" "SELECT id, title, tags FROM notes WHERE id = $rid;")
+                    echo "  #$related_info"
+                fi
+            done
+        fi
+
+        echo "---"
     done
 }
 
@@ -516,8 +612,133 @@ cmd_delete() {
         return 1
     fi
 
+    # Clean up orphaned links in other notes
+    local all_notes
+    all_notes=$(sqlite3 "$DB_FILE" "SELECT id FROM notes WHERE related_ids != '';")
+
+    for note_id in $all_notes; do
+        remove_related_id "$note_id" "$id"
+    done
+
+    # Delete the note
     sqlite3 "$DB_FILE" "DELETE FROM notes WHERE id = $id;"
     echo "Deleted note #$id"
+}
+
+# Link two notes (bidirectional by default)
+cmd_link() {
+    ensure_db
+    if [ $# -lt 2 ]; then
+        echo "Usage: zk link ID1 ID2"
+        return 1
+    fi
+
+    local id1="$1"
+    local id2="$2"
+
+    validate_id "$id1" || return 1
+    validate_id "$id2" || return 1
+
+    if [ "$id1" = "$id2" ]; then
+        echo -e "${RED}Error: Cannot link a note to itself${RESET}" >&2
+        return 1
+    fi
+
+    if ! note_exists "$id1"; then
+        echo -e "${RED}Error: Note #$id1 not found${RESET}" >&2
+        return 1
+    fi
+
+    if ! note_exists "$id2"; then
+        echo -e "${RED}Error: Note #$id2 not found${RESET}" >&2
+        return 1
+    fi
+
+    # Add bidirectional links
+    add_related_id "$id1" "$id2"
+    add_related_id "$id2" "$id1"
+
+    echo "Linked notes #$id1 ↔ #$id2"
+}
+
+# Unlink two notes (bidirectional)
+cmd_unlink() {
+    ensure_db
+    if [ $# -lt 2 ]; then
+        echo "Usage: zk unlink ID1 ID2"
+        return 1
+    fi
+
+    local id1="$1"
+    local id2="$2"
+
+    validate_id "$id1" || return 1
+    validate_id "$id2" || return 1
+
+    if ! note_exists "$id1"; then
+        echo -e "${RED}Error: Note #$id1 not found${RESET}" >&2
+        return 1
+    fi
+
+    if ! note_exists "$id2"; then
+        echo -e "${RED}Error: Note #$id2 not found${RESET}" >&2
+        return 1
+    fi
+
+    # Remove bidirectional links
+    remove_related_id "$id1" "$id2"
+    remove_related_id "$id2" "$id1"
+
+    echo "Unlinked notes #$id1 ↔ #$id2"
+}
+
+# Show related notes
+cmd_related() {
+    ensure_db
+    if [ $# -eq 0 ]; then
+        echo "Usage: zk related ID [--full]"
+        return 1
+    fi
+
+    local id="$1"
+    local full_content=0
+
+    if [ "${2:-}" = "--full" ] || [ "${2:-}" = "-f" ]; then
+        full_content=1
+    fi
+
+    validate_id "$id" || return 1
+
+    if ! note_exists "$id"; then
+        echo -e "${RED}Error: Note #$id not found${RESET}" >&2
+        return 1
+    fi
+
+    local related_ids
+    related_ids=$(get_related_ids "$id")
+
+    if [ -z "$related_ids" ]; then
+        echo -e "${YELLOW}No related notes found for #$id${RESET}" >&2
+        return 0
+    fi
+
+    if [ "$full_content" -eq 1 ]; then
+        # Get full content of all related notes
+        IFS=',' read -ra IDS <<< "$related_ids"
+        for rid in "${IDS[@]}"; do
+            if note_exists "$rid"; then
+                cmd_get "$rid"
+            fi
+        done
+    else
+        # Show minimal list
+        IFS=',' read -ra IDS <<< "$related_ids"
+        for rid in "${IDS[@]}"; do
+            if note_exists "$rid"; then
+                sqlite3 -separator '|' "$DB_FILE" "SELECT id, title, tags, COALESCE(project, 'global') FROM notes WHERE id = $rid;"
+            fi
+        done
+    fi
 }
 
 # Show stats
@@ -680,6 +901,18 @@ case "${1:-}" in
         shift
         cmd_delete "$@"
         ;;
+    link)
+        shift
+        cmd_link "$@"
+        ;;
+    unlink)
+        shift
+        cmd_unlink "$@"
+        ;;
+    related)
+        shift
+        cmd_related "$@"
+        ;;
     stats)
         cmd_stats
         ;;
@@ -694,6 +927,9 @@ case "${1:-}" in
     feed)
         shift
         cmd_feed "$@"
+        ;;
+    upgrade)
+        upgrade_db
         ;;
     vacuum)
         cmd_vacuum

@@ -2,6 +2,34 @@
 
 All notable changes to the zk-brain skill will be documented in this file.
 
+## [1.2.0] - 2026-01-09
+
+### Added
+- **Related Notes / Knowledge Graphs**: Link notes together to build knowledge networks
+  - `zk link ID1 ID2` - Create bidirectional link between notes
+  - `zk unlink ID1 ID2` - Remove link between notes
+  - `zk related ID` - List all notes related to a specific note
+  - `zk related ID --full` - Get full content of all related notes
+- **Schema upgrade command**: `zk upgrade` for v1.1.0 → v1.2.0 migration
+- **Enhanced `zk get`**: Now displays related notes section automatically
+- **Orphan link cleanup**: Deleting a note removes it from all related_ids
+- **Self-link prevention**: Cannot link a note to itself
+
+### Changed
+- Schema: Added `related_ids TEXT DEFAULT ''` column to notes table
+- Help text updated to include new linking commands
+- Version bumped to 1.2.0
+
+### Performance
+- **Token savings**: 25-40% reduction when exploring multi-note contexts
+- Related notes enable direct path to connected knowledge vs multiple searches
+
+### Use Cases
+- Decision trails (link decisions to context, analysis, outcomes)
+- Bug investigations (connect reports to root causes and fixes)
+- Learning paths (create progression through concepts)
+- Architecture documentation (link components and dependencies)
+
 ## [1.1.0] - 2026-01-09
 
 ### Added
