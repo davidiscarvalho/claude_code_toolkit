@@ -1,0 +1,579 @@
+#!/bin/bash
+# zk - Zettelkasten Brain CLI for Claude Code
+# Token-efficient personal knowledge base using SQLite
+
+set -e
+
+ZK_DIR="${ZK_DIR:-$HOME/.claude/zk_brain}"
+DB_FILE="$ZK_DIR/brain.db"
+
+# Colors for output (disabled if not tty)
+if [ -t 1 ]; then
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    RESET='\033[0m'
+    CYAN='\033[36m'
+    GREEN='\033[32m'
+    YELLOW='\033[33m'
+else
+    BOLD='' DIM='' RESET='' CYAN='' GREEN='' YELLOW=''
+fi
+
+# Initialize database
+init_db() {
+    mkdir -p "$ZK_DIR"
+    sqlite3 "$DB_FILE" <<'SQL'
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    tags TEXT DEFAULT '',
+    project TEXT DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    archived_at DATETIME DEFAULT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_tags ON notes(tags);
+CREATE INDEX IF NOT EXISTS idx_notes_project ON notes(project);
+CREATE INDEX IF NOT EXISTS idx_notes_archived ON notes(archived_at);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+    title, content, tags,
+    content='notes',
+    content_rowid='id'
+);
+
+-- Triggers to keep FTS in sync
+CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+    INSERT INTO notes_fts(rowid, title, content, tags) VALUES (new.id, new.title, new.content, new.tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
+    INSERT INTO notes_fts(notes_fts, rowid, title, content, tags) VALUES('delete', old.id, old.title, old.content, old.tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
+    INSERT INTO notes_fts(notes_fts, rowid, title, content, tags) VALUES('delete', old.id, old.title, old.content, old.tags);
+    INSERT INTO notes_fts(rowid, title, content, tags) VALUES (new.id, new.title, new.content, new.tags);
+END;
+SQL
+    echo "Initialized zk_brain at $ZK_DIR"
+}
+
+# Ensure DB exists
+ensure_db() {
+    if [ ! -f "$DB_FILE" ]; then
+        init_db >/dev/null
+    fi
+}
+
+# Get current project from git or directory name
+get_current_project() {
+    local proj
+    proj=$(git rev-parse --show-toplevel 2>/dev/null | xargs basename 2>/dev/null) || proj=$(basename "$(pwd)")
+    echo "$proj"
+}
+
+# Usage/help
+usage() {
+    cat <<'EOF'
+zk - Zettelkasten Brain CLI
+
+SEARCH (cheap - returns IDs + titles only, ~50 tokens):
+  zk search "query"              Search all active notes
+  zk search -p PROJECT "query"   Search within project (use -p . for current)
+  zk search -a "query"           Include archived notes
+  zk search -t TAG "query"       Filter by tag
+
+RETRIEVE (fetch full content when needed):
+  zk get ID                      Get full note by ID
+  zk get ID ID2 ...              Get multiple notes
+
+ADD/UPDATE:
+  zk add "title" "tags" "content"           Add global note
+  zk add -p PROJECT "title" "tags" "content"  Add to project (-p . for current)
+  zk update ID "new content"                Update note content
+  zk update ID -t "new,tags"                Update tags
+  zk update ID -T "new title"               Update title
+
+LIST (minimal output):
+  zk list                        List all active notes (id, title, project)
+  zk list -p PROJECT             List project notes (-p . for current)
+  zk list -t TAG                 List by tag
+  zk list -a                     Include archived
+
+ORGANIZE:
+  zk tags                        List all tags with counts
+  zk projects                    List all projects with counts
+  zk archive ID                  Archive a note
+  zk unarchive ID                Restore archived note
+  zk delete ID                   Permanently delete note
+
+BULK OPERATIONS:
+  zk feed FILE                   Analyze file, suggest atomic notes (interactive)
+  zk import FILE                 Import notes from JSON/JSONL
+  zk export [FILE]               Export all notes to JSON
+  zk stats                       Show database statistics
+
+MAINTENANCE:
+  zk init                        Initialize/reset database
+  zk vacuum                      Optimize database
+  zk backup [FILE]               Backup database
+
+Examples:
+  zk search "authentication pattern"
+  zk add "Clerk redirect fix" "auth,clerk,bug" "After user creation, use..."
+  zk add -p . "API rate limits" "api,limits" "Current limits: 100/min"
+  zk get 42
+  zk list -p myproject
+EOF
+}
+
+# Search notes - returns minimal info for token efficiency
+cmd_search() {
+    ensure_db
+    local project="" include_archived=0 tag=""
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--project)
+                project="$2"
+                [ "$project" = "." ] && project=$(get_current_project)
+                shift 2
+                ;;
+            -a|--archived)
+                include_archived=1
+                shift
+                ;;
+            -t|--tag)
+                tag="$2"
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    local query="$*"
+    if [ -z "$query" ]; then
+        echo "Usage: zk search [-p project] [-a] [-t tag] \"query\""
+        return 1
+    fi
+    
+    local where_clause="archived_at IS NULL"
+    [ "$include_archived" = "1" ] && where_clause="1=1"
+    [ -n "$project" ] && where_clause="$where_clause AND project = '$project'"
+    [ -n "$tag" ] && where_clause="$where_clause AND tags LIKE '%$tag%'"
+    
+    # Convert query to FTS5 format (OR between words, with prefix matching)
+    local fts_query
+    fts_query=$(echo "$query" | sed 's/[[:space:]]\+/ OR /g; s/[^a-zA-Z0-9_ OR]//g')
+    
+    # FTS search with snippet for context
+    sqlite3 -separator '|' "$DB_FILE" <<SQL
+SELECT n.id, n.title, n.tags, COALESCE(n.project, 'global'),
+       snippet(notes_fts, 1, '>>>', '<<<', '...', 20) as excerpt
+FROM notes_fts f
+JOIN notes n ON n.id = f.rowid
+WHERE notes_fts MATCH '$fts_query' AND $where_clause
+ORDER BY rank
+LIMIT 20;
+SQL
+}
+
+# Get full note(s)
+cmd_get() {
+    ensure_db
+    if [ $# -eq 0 ]; then
+        echo "Usage: zk get ID [ID2 ...]"
+        return 1
+    fi
+    
+    for id in "$@"; do
+        sqlite3 -separator '|' "$DB_FILE" <<SQL
+SELECT '---', id, title, tags, COALESCE(project, 'global'), 
+       datetime(created_at), datetime(updated_at),
+       CASE WHEN archived_at IS NOT NULL THEN 'ARCHIVED' ELSE 'active' END
+FROM notes WHERE id = $id;
+SELECT content FROM notes WHERE id = $id;
+SELECT '---';
+SQL
+    done
+}
+
+# Add a note
+cmd_add() {
+    ensure_db
+    local project=""
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--project)
+                project="$2"
+                [ "$project" = "." ] && project=$(get_current_project)
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    if [ $# -lt 3 ]; then
+        echo "Usage: zk add [-p project] \"title\" \"tags\" \"content\""
+        return 1
+    fi
+    
+    local title="$1" tags="$2" content="$3"
+    
+    # Escape single quotes
+    title="${title//\'/\'\'}"
+    tags="${tags//\'/\'\'}"
+    content="${content//\'/\'\'}"
+    
+    local proj_sql="NULL"
+    [ -n "$project" ] && proj_sql="'$project'"
+    
+    local new_id
+    new_id=$(sqlite3 "$DB_FILE" <<SQL
+INSERT INTO notes (title, tags, content, project) VALUES ('$title', '$tags', '$content', $proj_sql);
+SELECT last_insert_rowid();
+SQL
+)
+    echo "Added note #$new_id: $title"
+}
+
+# Update a note
+cmd_update() {
+    ensure_db
+    if [ $# -lt 2 ]; then
+        echo "Usage: zk update ID \"new content\" | -t \"new,tags\" | -T \"new title\""
+        return 1
+    fi
+    
+    local id="$1"
+    shift
+    
+    case "$1" in
+        -t|--tags)
+            local tags="${2//\'/\'\'}"
+            sqlite3 "$DB_FILE" "UPDATE notes SET tags = '$tags', updated_at = CURRENT_TIMESTAMP WHERE id = $id;"
+            echo "Updated tags for note #$id"
+            ;;
+        -T|--title)
+            local title="${2//\'/\'\'}"
+            sqlite3 "$DB_FILE" "UPDATE notes SET title = '$title', updated_at = CURRENT_TIMESTAMP WHERE id = $id;"
+            echo "Updated title for note #$id"
+            ;;
+        *)
+            local content="${*//\'/\'\'}"
+            sqlite3 "$DB_FILE" "UPDATE notes SET content = '$content', updated_at = CURRENT_TIMESTAMP WHERE id = $id;"
+            echo "Updated content for note #$id"
+            ;;
+    esac
+}
+
+# List notes (minimal output)
+cmd_list() {
+    ensure_db
+    local project="" include_archived=0 tag="" limit=50
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--project)
+                project="$2"
+                [ "$project" = "." ] && project=$(get_current_project)
+                shift 2
+                ;;
+            -a|--archived)
+                include_archived=1
+                shift
+                ;;
+            -t|--tag)
+                tag="$2"
+                shift 2
+                ;;
+            -n|--limit)
+                limit="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+    
+    local where_clause="archived_at IS NULL"
+    [ "$include_archived" = "1" ] && where_clause="1=1"
+    [ -n "$project" ] && where_clause="$where_clause AND project = '$project'"
+    [ -n "$tag" ] && where_clause="$where_clause AND tags LIKE '%$tag%'"
+    
+    sqlite3 -separator '|' "$DB_FILE" <<SQL
+SELECT id, title, tags, COALESCE(project, 'global')
+FROM notes
+WHERE $where_clause
+ORDER BY updated_at DESC
+LIMIT $limit;
+SQL
+}
+
+# List all tags with counts
+cmd_tags() {
+    ensure_db
+    echo "TAG|COUNT"
+    sqlite3 -separator '|' "$DB_FILE" <<'SQL'
+WITH RECURSIVE split(tag, rest) AS (
+    SELECT '', tags || ',' FROM notes WHERE archived_at IS NULL AND tags != ''
+    UNION ALL
+    SELECT
+        TRIM(SUBSTR(rest, 1, INSTR(rest, ',') - 1)),
+        SUBSTR(rest, INSTR(rest, ',') + 1)
+    FROM split WHERE rest != ''
+)
+SELECT tag, COUNT(*) as cnt
+FROM split
+WHERE tag != ''
+GROUP BY tag
+ORDER BY cnt DESC, tag;
+SQL
+}
+
+# List all projects with counts
+cmd_projects() {
+    ensure_db
+    echo "PROJECT|COUNT"
+    sqlite3 -separator '|' "$DB_FILE" <<'SQL'
+SELECT COALESCE(project, 'global') as proj, COUNT(*) as cnt
+FROM notes
+WHERE archived_at IS NULL
+GROUP BY project
+ORDER BY cnt DESC;
+SQL
+}
+
+# Archive a note
+cmd_archive() {
+    ensure_db
+    if [ -z "$1" ]; then
+        echo "Usage: zk archive ID"
+        return 1
+    fi
+    sqlite3 "$DB_FILE" "UPDATE notes SET archived_at = CURRENT_TIMESTAMP WHERE id = $1;"
+    echo "Archived note #$1"
+}
+
+# Unarchive a note
+cmd_unarchive() {
+    ensure_db
+    if [ -z "$1" ]; then
+        echo "Usage: zk unarchive ID"
+        return 1
+    fi
+    sqlite3 "$DB_FILE" "UPDATE notes SET archived_at = NULL WHERE id = $1;"
+    echo "Unarchived note #$1"
+}
+
+# Delete a note permanently
+cmd_delete() {
+    ensure_db
+    if [ -z "$1" ]; then
+        echo "Usage: zk delete ID"
+        return 1
+    fi
+    sqlite3 "$DB_FILE" "DELETE FROM notes WHERE id = $1;"
+    echo "Deleted note #$1"
+}
+
+# Show stats
+cmd_stats() {
+    ensure_db
+    sqlite3 "$DB_FILE" <<'SQL'
+SELECT 'Total notes: ' || COUNT(*) FROM notes;
+SELECT 'Active notes: ' || COUNT(*) FROM notes WHERE archived_at IS NULL;
+SELECT 'Archived notes: ' || COUNT(*) FROM notes WHERE archived_at IS NOT NULL;
+SELECT 'Projects: ' || COUNT(DISTINCT project) FROM notes WHERE project IS NOT NULL;
+SELECT 'Unique tags: ' || (
+    WITH RECURSIVE split(tag, rest) AS (
+        SELECT '', tags || ',' FROM notes WHERE tags != ''
+        UNION ALL
+        SELECT TRIM(SUBSTR(rest, 1, INSTR(rest, ',') - 1)), SUBSTR(rest, INSTR(rest, ',') + 1)
+        FROM split WHERE rest != ''
+    )
+    SELECT COUNT(DISTINCT tag) FROM split WHERE tag != ''
+);
+SQL
+}
+
+# Export to JSON
+cmd_export() {
+    ensure_db
+    local outfile="${1:-/dev/stdout}"
+    sqlite3 -json "$DB_FILE" "SELECT * FROM notes;" > "$outfile"
+    [ "$outfile" != "/dev/stdout" ] && echo "Exported to $outfile"
+}
+
+# Import from JSON/JSONL
+cmd_import() {
+    ensure_db
+    if [ -z "$1" ] || [ ! -f "$1" ]; then
+        echo "Usage: zk import FILE.json|FILE.jsonl"
+        return 1
+    fi
+    
+    local file="$1"
+    local count=0
+    
+    # Handle JSONL (one JSON object per line)
+    if [[ "$file" == *.jsonl ]]; then
+        while IFS= read -r line; do
+            local title tags content project
+            title=$(echo "$line" | jq -r '.title // empty')
+            tags=$(echo "$line" | jq -r '.tags // empty')
+            content=$(echo "$line" | jq -r '.content // empty')
+            project=$(echo "$line" | jq -r '.project // empty')
+            
+            if [ -n "$title" ] && [ -n "$content" ]; then
+                if [ -n "$project" ]; then
+                    cmd_add -p "$project" "$title" "$tags" "$content" >/dev/null
+                else
+                    cmd_add "$title" "$tags" "$content" >/dev/null
+                fi
+                ((count++))
+            fi
+        done < "$file"
+    else
+        # Handle JSON array
+        local len
+        len=$(jq 'length' "$file")
+        for ((i=0; i<len; i++)); do
+            local title tags content project
+            title=$(jq -r ".[$i].title // empty" "$file")
+            tags=$(jq -r ".[$i].tags // empty" "$file")
+            content=$(jq -r ".[$i].content // empty" "$file")
+            project=$(jq -r ".[$i].project // empty" "$file")
+            
+            if [ -n "$title" ] && [ -n "$content" ]; then
+                if [ -n "$project" ]; then
+                    cmd_add -p "$project" "$title" "$tags" "$content" >/dev/null
+                else
+                    cmd_add "$title" "$tags" "$content" >/dev/null
+                fi
+                ((count++))
+            fi
+        done
+    fi
+    
+    echo "Imported $count notes"
+}
+
+# Feed - output file content for analysis (Claude will process this)
+cmd_feed() {
+    if [ -z "$1" ] || [ ! -f "$1" ]; then
+        echo "Usage: zk feed FILE"
+        echo ""
+        echo "This outputs the file content for Claude to analyze and suggest atomic notes."
+        echo "Claude should then use 'zk add' commands to add the curated notes."
+        return 1
+    fi
+    
+    echo "=== FILE: $1 ==="
+    echo "=== CONTENT START ==="
+    cat "$1"
+    echo ""
+    echo "=== CONTENT END ==="
+    echo ""
+    echo "Analyze this content and extract atomic, searchable knowledge notes."
+    echo "For each note, use: zk add \"title\" \"tags\" \"content\""
+}
+
+# Vacuum/optimize
+cmd_vacuum() {
+    ensure_db
+    sqlite3 "$DB_FILE" "VACUUM; ANALYZE;"
+    echo "Database optimized"
+}
+
+# Backup
+cmd_backup() {
+    ensure_db
+    local backup="${1:-$ZK_DIR/brain_backup_$(date +%Y%m%d_%H%M%S).db}"
+    cp "$DB_FILE" "$backup"
+    echo "Backed up to $backup"
+}
+
+# Main dispatch
+case "${1:-}" in
+    init)
+        init_db
+        ;;
+    search|s)
+        shift
+        cmd_search "$@"
+        ;;
+    get|g)
+        shift
+        cmd_get "$@"
+        ;;
+    add|a)
+        shift
+        cmd_add "$@"
+        ;;
+    update|u)
+        shift
+        cmd_update "$@"
+        ;;
+    list|ls|l)
+        shift
+        cmd_list "$@"
+        ;;
+    tags)
+        cmd_tags
+        ;;
+    projects|proj)
+        cmd_projects
+        ;;
+    archive)
+        shift
+        cmd_archive "$@"
+        ;;
+    unarchive)
+        shift
+        cmd_unarchive "$@"
+        ;;
+    delete|rm)
+        shift
+        cmd_delete "$@"
+        ;;
+    stats)
+        cmd_stats
+        ;;
+    export)
+        shift
+        cmd_export "$@"
+        ;;
+    import)
+        shift
+        cmd_import "$@"
+        ;;
+    feed)
+        shift
+        cmd_feed "$@"
+        ;;
+    vacuum)
+        cmd_vacuum
+        ;;
+    backup)
+        shift
+        cmd_backup "$@"
+        ;;
+    help|--help|-h|"")
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo "Run 'zk help' for usage"
+        exit 1
+        ;;
+esac
