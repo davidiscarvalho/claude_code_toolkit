@@ -612,13 +612,24 @@ cmd_delete() {
         return 1
     fi
 
-    # Clean up orphaned links in other notes
-    local all_notes
-    all_notes=$(sqlite3 "$DB_FILE" "SELECT id FROM notes WHERE related_ids != '';")
+    # Clean up orphaned links in other notes using SQL (much faster for large databases)
+    sqlite3 "$DB_FILE" <<SQL
+-- Remove from start of list
+UPDATE notes SET related_ids = SUBSTR(related_ids, LENGTH('$id') + 2)
+WHERE related_ids LIKE '$id,%';
 
-    for note_id in $all_notes; do
-        remove_related_id "$note_id" "$id"
-    done
+-- Remove from middle of list
+UPDATE notes SET related_ids = REPLACE(related_ids, ',$id,', ',')
+WHERE related_ids LIKE '%,$id,%';
+
+-- Remove from end of list
+UPDATE notes SET related_ids = SUBSTR(related_ids, 1, LENGTH(related_ids) - LENGTH('$id') - 1)
+WHERE related_ids LIKE '%,$id';
+
+-- Remove if only item
+UPDATE notes SET related_ids = ''
+WHERE related_ids = '$id';
+SQL
 
     # Delete the note
     sqlite3 "$DB_FILE" "DELETE FROM notes WHERE id = $id;"
