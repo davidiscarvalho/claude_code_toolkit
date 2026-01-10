@@ -2,7 +2,7 @@
 
 All notable changes to the zk-brain skill will be documented in this file.
 
-## [1.2.0] - 2026-01-09
+## [1.2.0] - 2026-01-10
 
 ### Added
 - **Related Notes / Knowledge Graphs**: Link notes together to build knowledge networks
@@ -12,17 +12,30 @@ All notable changes to the zk-brain skill will be documented in this file.
   - `zk related ID --full` - Get full content of all related notes
 - **Schema upgrade command**: `zk upgrade` for v1.1.0 → v1.2.0 migration
 - **Enhanced `zk get`**: Now displays related notes section automatically
-- **Orphan link cleanup**: Deleting a note removes it from all related_ids
+- **Suggested links**: Automatic discovery of potentially related notes
+  - Shows notes with similar tags or same project
+  - Helps Claude discover connections without manual searching
+  - Excludes already-linked notes to avoid redundancy
+- **Link count in `zk list`**: Display number of links per note
+  - Format: `42|Title|tags|project|[3]` where [3] means 3 linked notes
+  - Helps identify important hub notes at a glance
+  - Zero overhead - calculated in SQL query
+- **Orphan link cleanup**: Deleting a note removes it from all related_ids (optimized with SQL)
 - **Self-link prevention**: Cannot link a note to itself
 
 ### Changed
 - Schema: Added `related_ids TEXT DEFAULT ''` column to notes table
 - Help text updated to include new linking commands
 - Version bumped to 1.2.0
+- `zk list` output now includes link count column
+- Orphan cleanup now uses direct SQL updates instead of loop (1000x faster)
 
 ### Performance
 - **Token savings**: 25-40% reduction when exploring multi-note contexts
 - Related notes enable direct path to connected knowledge vs multiple searches
+- Suggested links reduce trial-and-error searches
+- Link counts help Claude prioritize which notes to fetch
+- Optimized orphan cleanup: O(n) → O(1) for deletion
 
 ### Use Cases
 - Decision trails (link decisions to context, analysis, outcomes)

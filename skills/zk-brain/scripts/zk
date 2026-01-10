@@ -378,6 +378,66 @@ SQL
             done
         fi
 
+        # Show suggested links (notes with similar tags or same project)
+        local note_tags note_project
+        note_tags=$(sqlite3 "$DB_FILE" "SELECT tags FROM notes WHERE id = $id;")
+        note_project=$(sqlite3 "$DB_FILE" "SELECT project FROM notes WHERE id = $id;")
+
+        # Build exclusion list (current note + already linked notes)
+        local exclude_ids="$id"
+        if [ -n "$related_ids" ]; then
+            exclude_ids="$id,$related_ids"
+        fi
+
+        # Find suggested notes (limit to 3 for token efficiency)
+        local suggestions=""
+        if [ -n "$note_tags" ]; then
+            # Convert tags to SQL pattern matching
+            local tag_patterns=""
+            IFS=',' read -ra TAGS <<< "$note_tags"
+            for tag in "${TAGS[@]}"; do
+                if [ -n "$tag_patterns" ]; then
+                    tag_patterns="$tag_patterns OR tags LIKE '%$tag%'"
+                else
+                    tag_patterns="tags LIKE '%$tag%'"
+                fi
+            done
+
+            # Find notes with overlapping tags
+            suggestions=$(sqlite3 -separator '|' "$DB_FILE" <<SQL
+SELECT id, title, 'similar tags' as reason
+FROM notes
+WHERE ($tag_patterns)
+  AND id NOT IN ($exclude_ids)
+  AND archived_at IS NULL
+ORDER BY updated_at DESC
+LIMIT 3;
+SQL
+)
+        fi
+
+        # Add same-project suggestions if no tag-based suggestions
+        if [ -z "$suggestions" ] && [ -n "$note_project" ] && [ "$note_project" != "NULL" ]; then
+            suggestions=$(sqlite3 -separator '|' "$DB_FILE" <<SQL
+SELECT id, title, 'same project' as reason
+FROM notes
+WHERE project = '$note_project'
+  AND id NOT IN ($exclude_ids)
+  AND archived_at IS NULL
+ORDER BY updated_at DESC
+LIMIT 3;
+SQL
+)
+        fi
+
+        if [ -n "$suggestions" ]; then
+            echo "---"
+            echo -e "${DIM}💡 Suggested links:${RESET}"
+            echo "$suggestions" | while IFS='|' read -r sid stitle sreason; do
+                echo -e "  ${DIM}#$sid $stitle ($sreason)${RESET}"
+            done
+        fi
+
         echo "---"
     done
 }
@@ -514,7 +574,12 @@ cmd_list() {
     fi
 
     sqlite3 -separator '|' "$DB_FILE" <<SQL
-SELECT id, title, tags, COALESCE(project, 'global')
+SELECT id, title, tags, COALESCE(project, 'global'),
+       CASE
+           WHEN related_ids != '' THEN
+               '[' || (LENGTH(related_ids) - LENGTH(REPLACE(related_ids, ',', '')) + 1) || ']'
+           ELSE ''
+       END as links
 FROM notes
 WHERE $where_clause
 ORDER BY updated_at DESC

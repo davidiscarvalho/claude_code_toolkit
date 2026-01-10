@@ -135,6 +135,13 @@ zk related 42 --full           # Get full content of all related notes
 - After: Direct path via links (~100-150 tokens)
 - Savings: 25-40% for multi-note exploration
 
+**Smart discovery features:**
+- **Link counts**: `zk list` shows `[3]` to indicate 3 linked notes - helps identify important hub notes
+- **Suggested links**: `zk get` automatically suggests related notes based on tags/project
+  - Example: "💡 Suggested links: #5 Test Note (similar tags)"
+  - Helps discover connections without manual searching
+  - Excludes already-linked notes
+
 #### List & Organize
 
 ```bash
