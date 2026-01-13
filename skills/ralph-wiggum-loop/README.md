@@ -7,3 +7,8 @@ Attached is the ralph.ps1 (for windows powershell), ralph.sh (for everyone else)
 
 
 In this folder, there is the Ralph Wiggum loop script, which does not block the Claude code session exit (using the stop hook), but it starts a new session with a blank context
+
+
+
+**original ralph wiggum loop**
+https://github.com/ghuntley/how-to-ralph-wiggum
